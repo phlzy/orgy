@@ -146,7 +146,11 @@ impl Repo {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
         }
-        let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let mut root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Git 输出使用 `/`；在 Windows 上统一成原生分隔符，避免日志里出现混合路径。
+        if std::path::MAIN_SEPARATOR != '/' {
+            root = root.replace('/', std::path::MAIN_SEPARATOR_STR);
+        }
         Ok(Self {
             root: PathBuf::from(root),
         })
@@ -311,6 +315,105 @@ impl Repo {
             .args(["rev-parse", "HEAD"])
             .output()?;
         Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
+    }
+
+    // ------------------------------------------------------------------
+    // 任务工作区（M0 §3.5）
+    // ------------------------------------------------------------------
+
+    /// 确保受管工作区根目录存在并返回它。
+    pub fn ensure_worktrees_root(&self) -> Result<PathBuf> {
+        let root = self.worktrees_root();
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    /// 任务 ID 会直接成为工作区目录名，因此必须是单个安全路径组件。
+    pub fn validate_task_id(task_id: &str) -> Result<()> {
+        let bad = task_id.is_empty()
+            || task_id == "."
+            || task_id == ".."
+            || task_id.contains(['/', '\\', ':', '\0'])
+            || task_id.chars().any(char::is_control);
+        if bad {
+            return Err(Error::Config(format!(
+                "任务 ID 不能用作目录名：{task_id:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 词法层校验：目标必须是受管工作区根目录的**直接子目录**。
+    ///
+    /// 用于"即将创建"的路径——此时目录还不存在，无法用 canonicalize 比较。
+    fn assert_planned_worktree_path(&self, path: &Path) -> Result<()> {
+        let root = self.worktrees_root();
+        let unsafe_path = || Error::UnsafeDestructivePath {
+            path: path.to_path_buf(),
+            root: root.clone(),
+        };
+        if path.parent() != Some(root.as_path()) {
+            return Err(unsafe_path());
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(unsafe_path)?;
+        Self::validate_task_id(name).map_err(|_| unsafe_path())?;
+        Ok(())
+    }
+
+    /// 该路径是否为 Git 已登记的工作区。
+    pub fn is_registered_worktree(&self, path: &Path) -> Result<bool> {
+        let list = self.git(&["worktree", "list", "--porcelain"])?;
+        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        for line in list.lines() {
+            let Some(rest) = line.strip_prefix("worktree ") else {
+                continue;
+            };
+            let entry = PathBuf::from(rest.trim());
+            let entry = entry.canonicalize().unwrap_or(entry);
+            if entry == target {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// 创建或复用任务工作区，并把它重置到基线提交。
+    ///
+    /// 复用路径是 M0 的常态（同一 Task 的多次 Attempt 共享固定目录），
+    /// 因此这里必须把残留内容清干净，否则上一次的可能污染下一次。
+    pub fn prepare_worktree(&self, task_id: &str, base_rev: &str) -> Result<PathBuf> {
+        Self::validate_task_id(task_id)?;
+        let root = self.ensure_worktrees_root()?;
+        let path = root.join(task_id);
+        self.assert_planned_worktree_path(&path)?;
+
+        if path.exists() {
+            if self.is_registered_worktree(&path)? {
+                // 护栏在 reset_hard/clean_fdx 内部按 canonical path 再确认一次。
+                self.reset_hard(&path, base_rev)?;
+                self.clean_fdx(&path)?;
+                return Ok(path);
+            }
+            // 目录存在但未登记：属于上次异常退出的残留，清掉后重建。
+            let _ = self.git_status_only(&["worktree", "prune"]);
+            std::fs::remove_dir_all(&path)?;
+        }
+
+        let path_str = path.to_string_lossy().to_string();
+        self.git(&["worktree", "add", "--detach", &path_str, base_rev])?;
+        Ok(path)
+    }
+
+    /// 移除任务工作区并清理 Git 元数据。
+    pub fn remove_worktree(&self, path: &Path) -> Result<()> {
+        self.guard_destructive(path)?;
+        let path_str = path.to_string_lossy().to_string();
+        self.git(&["worktree", "remove", "--force", &path_str])?;
+        let _ = self.git_status_only(&["worktree", "prune"]);
+        Ok(())
     }
 }
 
@@ -490,5 +593,128 @@ mod tests {
     fn 父目录组件可被识别() {
         assert!(has_parent_component("src/../x"));
         assert!(!has_parent_component("src/uart.c"));
+    }
+
+    // ------------------------------------------------------------------
+    // 任务工作区（需要真实 Git 仓库）
+    // ------------------------------------------------------------------
+
+    fn temp_repo(name: &str) -> (Repo, PathBuf) {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp/git")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} 失败：{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "orgy-test"]);
+        git(&["config", "user.email", "orgy-test@example.com"]);
+        std::fs::write(dir.join("base.txt"), "hello\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        (Repo::discover(&dir).unwrap(), dir)
+    }
+
+    fn worktree_head(path: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn 工作区创建在基线提交上() {
+        let (repo, _dir) = temp_repo("create");
+        let base = repo.head().unwrap();
+        let wt = repo.prepare_worktree("T-1", &base).unwrap();
+        assert!(wt.is_dir());
+        assert!(wt.join(".git").is_file(), "工作区应带有 .git 文件");
+        assert_eq!(worktree_head(&wt), base);
+        assert!(repo.is_registered_worktree(&wt).unwrap());
+    }
+
+    #[test]
+    fn 复用工作区会丢弃上次残留() {
+        let (repo, _dir) = temp_repo("reuse");
+        let base = repo.head().unwrap();
+        let wt = repo.prepare_worktree("T-1", &base).unwrap();
+        std::fs::write(wt.join("base.txt"), "dirty\n").unwrap();
+        std::fs::write(wt.join("leftover.tmp"), "x").unwrap();
+
+        let wt2 = repo.prepare_worktree("T-1", &base).unwrap();
+        assert_eq!(wt, wt2, "同一任务必须复用固定路径");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("base.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!wt.join("leftover.tmp").exists(), "未跟踪残留必须被清理");
+    }
+
+    #[test]
+    fn 工作区可移除() {
+        let (repo, _dir) = temp_repo("remove");
+        let base = repo.head().unwrap();
+        let wt = repo.prepare_worktree("T-1", &base).unwrap();
+        repo.remove_worktree(&wt).unwrap();
+        assert!(!wt.exists());
+        assert!(!repo.is_registered_worktree(&wt).unwrap());
+    }
+
+    #[test]
+    fn 破坏性操作不能指向仓库根() {
+        let (repo, dir) = temp_repo("guard");
+        let err = repo.clean_fdx(&dir).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::UnsafeDestructivePath { .. }),
+            "实际错误：{err}"
+        );
+        assert!(repo.reset_hard(&dir, "HEAD").is_err());
+    }
+
+    #[test]
+    fn 非法任务_id_被拒绝() {
+        let (repo, _dir) = temp_repo("badid");
+        let base = repo.head().unwrap();
+        for bad in ["../escape", "a/b", "a\\b", "", ".", "..", "C:"] {
+            assert!(
+                repo.prepare_worktree(bad, &base).is_err(),
+                "不应接受任务 ID：{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 越界修改在工作区快照上被拦截() {
+        let (repo, _dir) = temp_repo("scope");
+        let base = repo.head().unwrap();
+        let wt = repo.prepare_worktree("T-1", &base).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/uart.c"), "int uart_read(void){return 0;}\n").unwrap();
+
+        let matcher = WritesMatcher::new(&["src/uart.c".to_string()]).unwrap();
+        let snap = repo.snapshot_commit(&wt, "snapshot").unwrap();
+        let changes = repo.changed_paths(&base, &snap).unwrap();
+        assert!(validate_changes(&changes, &matcher).is_ok(), "写集内修改应通过");
+
+        // 前缀绕过：`src/uart.c.evil` 不在写集内。
+        std::fs::write(wt.join("src/uart.c.evil"), "x").unwrap();
+        let snap2 = repo.snapshot_commit(&wt, "snapshot2").unwrap();
+        let changes2 = repo.changed_paths(&snap, &snap2).unwrap();
+        assert!(validate_changes(&changes2, &matcher).is_err(), "前缀绕过必须被拦截");
     }
 }

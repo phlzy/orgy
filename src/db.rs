@@ -257,6 +257,16 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// 该任务下一个尝试序号（从 1 开始，不复用已用过的序号）。
+    pub fn next_attempt_num(&self, task_id: &str) -> Result<u32> {
+        let max: Option<i64> = self.conn.query_row(
+            "SELECT MAX(attempt_num) FROM attempts WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )?;
+        Ok(max.unwrap_or(0) as u32 + 1)
+    }
+
     pub fn latest_passed_receipt(&self, task_id: &str) -> Result<Option<ReceiptRow>> {
         let row = self
             .conn

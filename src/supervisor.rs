@@ -1,11 +1,11 @@
 //! Supervisor 主循环（M0.md §5.2）。
 //!
-//! 本文件当前只落地了两个纯判定环节：
-//! - `fresh_check`：§4.3 的 4 条 FRESH 条件；
-//! - `current_digests`：按当前磁盘规范计算 spec/plan 指纹。
+//! 已落地：
+//! - 步骤 1：`fresh_check`（§4.3 的四条 FRESH 条件）；
+//! - 步骤 2：`prepare_attempt`（固定工作区、基线、日志路径与启动指纹）。
 //!
-//! 步骤 2–7（建工作区、启 CLI、采快照、staging 验收、防漂移、两步晋升）留待下一步实现，
-//! 调用 `run_task` 会明确返回"尚未实现"，不会静默跳过。
+//! 未落地：步骤 3–7（启动 CLI、快照对账、staging 验收、防漂移、两步晋升）。
+//! `run_task` 会明确返回"尚未实现"，不会静默跳过。
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,20 @@ pub const ACCEPTED_REF: &str = "refs/orgy/accepted";
 pub enum Freshness {
     Fresh,
     Stale(String),
+}
+
+/// 一次 Attempt 的准备结果（M0 §5.2 步骤 2 的产物）。
+#[derive(Debug, Clone)]
+pub struct AttemptContext {
+    pub task_id: String,
+    pub attempt_num: u32,
+    /// 本次 Attempt 的代码基线：`refs/orgy/accepted` 的提交。
+    pub base_commit: String,
+    pub worktree: PathBuf,
+    /// 启动时刻的规范指纹，用于事后判定规范是否在运行期间被改动。
+    pub spec_digest: String,
+    pub plan_digest: String,
+    pub log_path: PathBuf,
 }
 
 pub struct Supervisor {
@@ -101,6 +115,39 @@ impl Supervisor {
         }
 
         Ok(Freshness::Fresh)
+    }
+
+    /// M0 §5.2 步骤 2：准备一次 Attempt 的上下文（工作区、基线、日志路径）。
+    ///
+    /// 只做"准备"，不启动 CLI。这样步骤 2 可以单独验收，也便于调试时手工检查工作区。
+    pub fn prepare_attempt(&self, task_id: &str) -> Result<AttemptContext> {
+        self.spec.task(task_id)?;
+        let accepted = self.repo.read_ref(ACCEPTED_REF)?.ok_or_else(|| {
+            Error::Config("refs/orgy/accepted 不存在，请先运行 `orgy init`".into())
+        })?;
+        let (spec_digest, plan_digest) = self.current_digests(task_id)?;
+        let attempt_num = self.db.next_attempt_num(task_id)?;
+        let worktree = self.repo.prepare_worktree(task_id, &accepted)?;
+        let log_path = self
+            .repo
+            .root()
+            .join(".orgy")
+            .join("runtime")
+            .join("logs")
+            .join(format!("{task_id}.a{attempt_num}.log"));
+
+        self.db
+            .upsert_task(task_id, "RUNNING", &spec_digest, &plan_digest, None)?;
+
+        Ok(AttemptContext {
+            task_id: task_id.to_string(),
+            attempt_num,
+            base_commit: accepted,
+            worktree,
+            spec_digest,
+            plan_digest,
+            log_path,
+        })
     }
 
     pub fn run_task(&self, _task_id: &str) -> Result<()> {

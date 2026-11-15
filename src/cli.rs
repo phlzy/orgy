@@ -29,6 +29,11 @@ pub enum Command {
         /// 任务 ID，例如 T-1
         task_id: String,
     },
+    /// 准备任务工作区并记录启动指纹（M0 调试命令，不启动 CLI）
+    Prepare {
+        /// 任务 ID，例如 T-1
+        task_id: String,
+    },
     /// 查看任务状态
     Status,
 }
@@ -50,6 +55,18 @@ pub fn dispatch(cwd: &Path, cli: Cli) -> Result<()> {
             }
         }
         Command::Status => status(cwd),
+        Command::Prepare { task_id } => {
+            let sup = Supervisor::open(cwd)?;
+            let ctx = sup.prepare_attempt(&task_id)?;
+            println!("任务       : {}", ctx.task_id);
+            println!("尝试序号   : {}", ctx.attempt_num);
+            println!("基线提交   : {}", ctx.base_commit);
+            println!("工作区     : {}", ctx.worktree.display());
+            println!("spec_digest: {}", short(&ctx.spec_digest));
+            println!("plan_digest: {}", short(&ctx.plan_digest));
+            println!("日志路径   : {}", ctx.log_path.display());
+            Ok(())
+        }
     }
 }
 
