@@ -1,0 +1,12 @@
+# 构建产物
+/target/
+
+# ORGY 运行态：机器权威，不进 Git（M0.md §2）
+/.orgy/runtime/
+
+# Worker 交付出口（M0.md §3.4）
+/.orgy/outbox/
+
+# 调试符号与本地临时文件
+*.pdb
+*.log

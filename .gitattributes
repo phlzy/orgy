@@ -1,0 +1,11 @@
+# 统一换行为 LF：spec 的字节一致性是 ORGY 的失效判定依据之一，
+# 不能让 Git 的自动换行转换在不同机器上产生"内容相同但字节不同"的假差异。
+* text=auto eol=lf
+
+# 明确二进制文件，避免被当作文本参与换行转换与差异展示。
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
+*.sqlite3 binary
+*.exe binary

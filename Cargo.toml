@@ -1,0 +1,21 @@
+[package]
+name = "orgy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+globset = "0.4.21"
+hex = "0.4.3"
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yml = "0.0.13"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem"] }
+
+# D8050 规避：本机环境在 workspace 内编译 SQLite C 源码时，cl.exe 带 -Z7
+# 会因"无法写入调试记录"而失败；关闭该包的调试信息即可（我们不会调试 SQLite）。
+[profile.dev.package.libsqlite3-sys]
+debug = false
