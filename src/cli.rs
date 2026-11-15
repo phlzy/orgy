@@ -38,23 +38,18 @@ pub enum Command {
     Status,
 }
 
-pub fn dispatch(cwd: &Path, cli: Cli) -> Result<()> {
+/// 命令分发。返回值即进程退出码：0 成功，1 任务未通过。
+pub fn dispatch(cwd: &Path, cli: Cli) -> Result<u8> {
     match cli.command {
-        Command::Init => init(cwd),
-        Command::Run { task_id } => {
-            let sup = Supervisor::open(cwd)?;
-            match sup.fresh_check(&task_id)? {
-                crate::supervisor::Freshness::Fresh => {
-                    println!("任务 {task_id} 已是 FRESH，无需重跑。");
-                    Ok(())
-                }
-                crate::supervisor::Freshness::Stale(reason) => {
-                    println!("任务 {task_id} 需要执行，原因：{reason}");
-                    sup.run_task(&task_id)
-                }
-            }
+        Command::Init => {
+            init(cwd)?;
+            Ok(0)
         }
-        Command::Status => status(cwd),
+        Command::Run { task_id } => run(cwd, &task_id),
+        Command::Status => {
+            status(cwd)?;
+            Ok(0)
+        }
         Command::Prepare { task_id } => {
             let sup = Supervisor::open(cwd)?;
             let ctx = sup.prepare_attempt(&task_id)?;
@@ -65,9 +60,44 @@ pub fn dispatch(cwd: &Path, cli: Cli) -> Result<()> {
             println!("spec_digest: {}", short(&ctx.spec_digest));
             println!("plan_digest: {}", short(&ctx.plan_digest));
             println!("日志路径   : {}", ctx.log_path.display());
-            Ok(())
+            Ok(0)
         }
     }
+}
+
+/// `orgy run`：FRESH 判定 → 准备 → 执行一次 Attempt → 输出 verdict。
+fn run(cwd: &Path, task_id: &str) -> Result<u8> {
+    let sup = Supervisor::open(cwd)?;
+    match sup.fresh_check(task_id)? {
+        crate::supervisor::Freshness::Fresh => {
+            println!("任务 {task_id} 已是 FRESH，无需重跑。");
+            return Ok(0);
+        }
+        crate::supervisor::Freshness::Stale(reason) => {
+            println!("任务 {task_id} 需要执行，原因：{reason}");
+        }
+    }
+
+    let ctx = sup.prepare_attempt(task_id)?;
+    println!(
+        "开始第 {} 次尝试（基线 {}）…",
+        ctx.attempt_num,
+        short(&ctx.base_commit)
+    );
+    let outcome = sup.run_attempt(&ctx)?;
+
+    println!("结论       : {}", outcome.verdict.as_str());
+    println!("说明       : {}", outcome.verdict.detail());
+    println!("退出码     : {:?}", outcome.exit_code);
+    if let Some(snapshot) = &outcome.snapshot_commit {
+        println!("快照提交   : {}", short(snapshot));
+    }
+    println!("日志       : {}", outcome.log_path.display());
+
+    if outcome.verdict == crate::supervisor::Verdict::Passed {
+        println!("\n注意：L3（staging 独立验收）与晋升尚未实现，本候选还不能算完成。");
+    }
+    Ok(u8::from(outcome.verdict != crate::supervisor::Verdict::Passed))
 }
 
 /// 初始化：校验主工作区干净 → 建目录 → 建库 → 固定 accepted ref。

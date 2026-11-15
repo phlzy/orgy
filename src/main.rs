@@ -3,13 +3,16 @@
 // 骨架阶段：部分 API 面向 M0 后续步骤（步骤 2–7），暂未全部接入。
 #![allow(dead_code)]
 
+mod adapter;
 mod cli;
 mod config;
 mod db;
 mod digest;
 mod error;
 mod git;
+mod handoff;
 mod process;
+mod prompt;
 mod supervisor;
 
 use std::process::ExitCode;
@@ -27,7 +30,7 @@ fn main() -> ExitCode {
     };
 
     match cli::dispatch(&cwd, cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("错误：{err}");
             ExitCode::FAILURE

@@ -306,6 +306,41 @@ impl Repo {
         Ok(true)
     }
 
+    /// 公共 Git 目录（worktree 的 `.git` 文件指向它）。
+    ///
+    /// Worker 需要它被 `--add-dir` 授权，否则连 `git status` 刷新索引都会被沙箱拒绝。
+    pub fn git_common_dir(&self) -> Result<PathBuf> {
+        let out = self.git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        Ok(PathBuf::from(out.trim()))
+    }
+
+    /// 把 ORGY 自己的运行态与出口目录写进 `.git/info/exclude`。
+    ///
+    /// 用 per-clone 的 exclude 而不是仓库里的 `.gitignore`：不污染用户版本库，
+    /// 也让 `git add -A` 不会把 outbox 交付物或运行态卷进快照。
+    pub fn ensure_excluded(&self) -> Result<()> {
+        const PATTERNS: [&str; 2] = [".orgy/outbox/", ".orgy/runtime/"];
+        let info = self.git_common_dir()?.join("info");
+        std::fs::create_dir_all(&info)?;
+        let path = info.join("exclude");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut changed = false;
+        for pattern in PATTERNS {
+            if !text.lines().any(|line| line.trim() == pattern) {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(pattern);
+                text.push('\n');
+                changed = true;
+            }
+        }
+        if changed {
+            std::fs::write(&path, text)?;
+        }
+        Ok(())
+    }
+
     /// 破坏性操作守门人：目标目录的规范化路径必须位于受管工作区之下。
     fn guard_destructive(&self, worktree: &Path) -> Result<()> {
         let worktrees_root = self.worktrees_root();
