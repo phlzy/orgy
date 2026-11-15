@@ -56,24 +56,33 @@ pub enum ChangeKind {
     Added,
     Modified,
     Deleted,
+    /// 类型变化（如普通文件变成符号链接）。M0 一律拒绝。
+    TypeChanged,
     Renamed,
     Copied,
     Other(char),
 }
 
+/// 一条变更的完整事实：状态、双方路径、以及 Git 记录的文件模式。
+///
+/// 模式必须保留：判断"是不是符号链接/子模块"不能只看状态字母，
+/// `A` 状态的条目同样可能是 mode 120000 的符号链接。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathChange {
+pub struct RawChange {
     pub kind: ChangeKind,
+    pub old_mode: Option<u32>,
+    pub new_mode: Option<u32>,
     /// 普通变更为 1 个路径；重命名/复制为 [源, 目标]。
     pub paths: Vec<String>,
 }
 
-impl PathChange {
-    fn single(kind: ChangeKind, path: &str) -> Self {
-        Self {
-            kind,
-            paths: vec![path.to_string()],
-        }
+impl RawChange {
+    /// 符号链接（120000）与 Gitlink/子模块（160000）在 M0 中一律视为越界。
+    fn forbidden_mode(&self) -> Option<u32> {
+        [self.old_mode, self.new_mode]
+            .into_iter()
+            .flatten()
+            .find(|mode| matches!(mode, 0o120000 | 0o160000))
     }
 }
 
@@ -110,9 +119,26 @@ impl WritesMatcher {
     }
 }
 
-/// 校验一组变更是否全部落在写集内；返回第一条违规说明。
-pub fn validate_changes(changes: &[PathChange], matcher: &WritesMatcher) -> Result<()> {
+/// 校验一组变更是否全部落在写集内，并拒绝类型层面禁止的变更。
+///
+/// 三道检查（缺一不可）：
+/// 1. 状态为 `TypeChanged` 直接拒绝；
+/// 2. Git 模式为符号链接或 Gitlink 直接拒绝——文件名合规不代表内容合规；
+/// 3. 路径必须通过归一化与写集匹配。
+pub fn validate_changes(changes: &[RawChange], matcher: &WritesMatcher) -> Result<()> {
     for change in changes {
+        if change.kind == ChangeKind::TypeChanged {
+            return Err(Error::Config(format!(
+                "拒绝类型变化（普通文件与符号链接互转会改变仓库语义）：{:?}",
+                change.paths
+            )));
+        }
+        if let Some(mode) = change.forbidden_mode() {
+            return Err(Error::Config(format!(
+                "拒绝符号链接或子模块（mode {mode:o}）：{:?}",
+                change.paths
+            )));
+        }
         for path in &change.paths {
             let Some(normalized) = normalize_rel_path(path) else {
                 return Err(Error::Config(format!("变更路径越界或非法：{path}")));
@@ -126,6 +152,28 @@ pub fn validate_changes(changes: &[PathChange], matcher: &WritesMatcher) -> Resu
         }
     }
     Ok(())
+}
+
+/// 在**工作区**里逐个确认变更路径不是真实的符号链接。
+///
+/// Git 模式的检查覆盖不了 `core.symlinks=false` 的情形（此时 Git 会把链接
+/// 存成普通文件），所以这里再对磁盘状态做一次确认。
+pub fn find_worktree_symlink(worktree: &Path, changes: &[RawChange]) -> Result<Option<String>> {
+    for change in changes {
+        for path in &change.paths {
+            let Some(normalized) = normalize_rel_path(path) else {
+                continue;
+            };
+            let absolute = worktree.join(&normalized);
+            let Ok(meta) = std::fs::symlink_metadata(&absolute) else {
+                continue; // 已删除的路径无需检查
+            };
+            if meta.file_type().is_symlink() {
+                return Ok(Some(normalized));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub struct Repo {
@@ -225,25 +273,37 @@ impl Repo {
         self.git_status_only(&["merge-base", "--is-ancestor", ancestor, descendant])
     }
 
-    /// 解析 `git diff --name-status -z`，保留重命名/复制的双方路径。
-    pub fn changed_paths(&self, base: &str, target: &str) -> Result<Vec<PathChange>> {
-        let out = self.git(&["diff", "--name-status", "-z", base, target])?;
-        parse_name_status_z(&out)
+    /// 解析 `git diff --raw -z`，保留重命名/复制的双方路径**与文件模式**。
+    ///
+    /// 用 `--raw` 而非 `--name-status`：后者只给状态字母，无法区分
+    /// "普通文件被新增"与"符号链接被新增"（两者都显示为 `A`）。
+    pub fn changed_entries(&self, base: &str, target: &str) -> Result<Vec<RawChange>> {
+        let out = self.git(&["diff", "--raw", "-z", base, target])?;
+        parse_raw_z(&out)
     }
 
-    /// 判定 `path..` 指定的路径集在两次提交之间是否完全未变。
-    pub fn paths_unchanged_between(
+    /// 本任务的写集在两次提交之间是否完全未被改动。
+    ///
+    /// 不在 Git 命令里传 glob：Git 的 pathspec 与 globset 语法不同
+    /// （例如 `{a,b}` 在 Git 里不展开、`*` 是否跨 `/` 的默认行为也不同），
+    /// 直接把 `task.writes` 当 pathspec 会造成漏检或误报。
+    /// 这里统一复用与写集校验完全相同的匹配器，保证语义一致。
+    pub fn writes_unchanged_between(
         &self,
         base: &str,
         target: &str,
-        paths: &[String],
+        matcher: &WritesMatcher,
     ) -> Result<bool> {
-        if paths.is_empty() {
-            return Ok(true);
+        for change in self.changed_entries(base, target)? {
+            if change
+                .paths
+                .iter()
+                .any(|path| matcher.is_allowed(path))
+            {
+                return Ok(false);
+            }
         }
-        let mut args: Vec<&str> = vec!["diff", "--quiet", base, target, "--"];
-        args.extend(paths.iter().map(|s| s.as_str()));
-        self.git_status_only(&args)
+        Ok(true)
     }
 
     /// 破坏性操作守门人：目标目录的规范化路径必须位于受管工作区之下。
@@ -432,42 +492,48 @@ fn run_in_dir(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// 解析 `-z` 输出的 name-status 记录。
+/// 解析 `git diff --raw -z` 输出。
 ///
-/// 格式：`STATUS\0path\0`，重命名/复制为 `STATUS\0old\0new\0`，
-/// STATUS 可能带相似度后缀（`R100`、`C075`）。
-pub fn parse_name_status_z(raw: &str) -> Result<Vec<PathChange>> {
+/// 每条记录的形态是：
+/// `:OLD_MODE NEW_MODE OLD_SHA NEW_SHA STATUS\0path\0`
+/// 重命名/复制为：`... STATUS\0old\0new\0`，STATUS 可能带相似度后缀（`R100`）。
+///
+/// 与 `--name-status` 的关键差别是**保留了文件模式**，因此能识别
+/// 新增的符号链接（`A` + 120000）与子模块 Gitlink（160000）。
+pub fn parse_raw_z(raw: &str) -> Result<Vec<RawChange>> {
     let mut tokens = raw.split('\0').filter(|t| !t.is_empty());
     let mut changes = Vec::new();
-    while let Some(status_token) = tokens.next() {
-        let code = status_token
+
+    while let Some(meta) = tokens.next() {
+        let Some(meta) = meta.strip_prefix(':') else {
+            return Err(Error::Other(format!("无法解析的 raw diff 记录：{meta}")));
+        };
+        let fields: Vec<&str> = meta.split(' ').collect();
+        if fields.len() < 5 {
+            return Err(Error::Other(format!("raw diff 记录字段不足：{meta}")));
+        }
+        let old_mode = parse_mode(fields[0]);
+        let new_mode = parse_mode(fields[1]);
+        let status = fields[4];
+        let code = status
             .chars()
             .next()
             .ok_or_else(|| Error::Other("空的 diff 状态标记".into()))?;
-        match code {
-            'R' => {
+
+        let (kind, paths) = match code {
+            'R' | 'C' => {
                 let from = tokens
                     .next()
-                    .ok_or_else(|| Error::Other("重命名记录缺少源路径".into()))?;
+                    .ok_or_else(|| Error::Other("重命名/复制记录缺少源路径".into()))?;
                 let to = tokens
                     .next()
-                    .ok_or_else(|| Error::Other("重命名记录缺少目标路径".into()))?;
-                changes.push(PathChange {
-                    kind: ChangeKind::Renamed,
-                    paths: vec![from.to_string(), to.to_string()],
-                });
-            }
-            'C' => {
-                let from = tokens
-                    .next()
-                    .ok_or_else(|| Error::Other("复制记录缺少源路径".into()))?;
-                let to = tokens
-                    .next()
-                    .ok_or_else(|| Error::Other("复制记录缺少目标路径".into()))?;
-                changes.push(PathChange {
-                    kind: ChangeKind::Copied,
-                    paths: vec![from.to_string(), to.to_string()],
-                });
+                    .ok_or_else(|| Error::Other("重命名/复制记录缺少目标路径".into()))?;
+                let kind = if code == 'R' {
+                    ChangeKind::Renamed
+                } else {
+                    ChangeKind::Copied
+                };
+                (kind, vec![from.to_string(), to.to_string()])
             }
             _ => {
                 let path = tokens
@@ -475,15 +541,28 @@ pub fn parse_name_status_z(raw: &str) -> Result<Vec<PathChange>> {
                     .ok_or_else(|| Error::Other("变更记录缺少路径".into()))?;
                 let kind = match code {
                     'A' => ChangeKind::Added,
-                    'M' | 'T' => ChangeKind::Modified,
+                    'M' => ChangeKind::Modified,
                     'D' => ChangeKind::Deleted,
+                    'T' => ChangeKind::TypeChanged,
                     other => ChangeKind::Other(other),
                 };
-                changes.push(PathChange::single(kind, path));
+                (kind, vec![path.to_string()])
             }
-        }
+        };
+
+        changes.push(RawChange {
+            kind,
+            old_mode,
+            new_mode,
+            paths,
+        });
     }
     Ok(changes)
+}
+
+/// Git 模式字符串（`100644`、`120000`、`000000`）→ 数值。
+fn parse_mode(text: &str) -> Option<u32> {
+    u32::from_str_radix(text, 8).ok()
 }
 
 /// 供 `config` 复用的路径组件检查（用于拒绝 `a/../b` 一类写法）。
@@ -549,18 +628,24 @@ mod tests {
     }
 
     #[test]
-    fn 解析_z_输出_普通变更() {
-        let raw = "M\0src/a.c\0A\0src/b.c\0D\0src/c.c\0";
-        let changes = parse_name_status_z(raw).unwrap();
+    fn 解析_raw_输出_普通变更含模式() {
+        let raw = concat!(
+            ":100644 100644 aaaa bbbb M\0src/a.c\0",
+            ":000000 100644 0000 cccc A\0src/b.c\0",
+            ":100644 000000 dddd 0000 D\0src/c.c\0",
+        );
+        let changes = parse_raw_z(raw).unwrap();
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].kind, ChangeKind::Modified);
+        assert_eq!(changes[0].new_mode, Some(0o100644));
         assert_eq!(changes[2].kind, ChangeKind::Deleted);
+        assert_eq!(changes[2].new_mode, Some(0));
     }
 
     #[test]
-    fn 解析_z_输出_重命名包含双方路径() {
-        let raw = "R100\0src/old.c\0src/new.c\0";
-        let changes = parse_name_status_z(raw).unwrap();
+    fn 解析_raw_输出_重命名包含双方路径() {
+        let raw = ":100644 100644 aaaa bbbb R100\0src/old.c\0src/new.c\0";
+        let changes = parse_raw_z(raw).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ChangeKind::Renamed);
         assert_eq!(changes[0].paths, vec!["src/old.c", "src/new.c"]);
@@ -570,8 +655,10 @@ mod tests {
     fn 重命名逃逸会被拦截() {
         let m = matcher(&["src/new.c"]);
         // 源路径 src/secret.c 不在写集内，即便目标路径合法也必须拒绝。
-        let changes = vec![PathChange {
+        let changes = vec![RawChange {
             kind: ChangeKind::Renamed,
+            old_mode: Some(0o100644),
+            new_mode: Some(0o100644),
             paths: vec!["src/secret.c".into(), "src/new.c".into()],
         }];
         assert!(validate_changes(&changes, &m).is_err());
@@ -581,12 +668,152 @@ mod tests {
     fn 多路径全部合规才通过() {
         let m = matcher(&["src/a.c", "src/b.c"]);
         let ok = vec![
-            PathChange::single(ChangeKind::Modified, "src/a.c"),
-            PathChange::single(ChangeKind::Added, r"src\b.c"),
+            RawChange {
+                kind: ChangeKind::Modified,
+                old_mode: Some(0o100644),
+                new_mode: Some(0o100644),
+                paths: vec!["src/a.c".into()],
+            },
+            RawChange {
+                kind: ChangeKind::Added,
+                old_mode: Some(0),
+                new_mode: Some(0o100644),
+                paths: vec![r"src\b.c".into()],
+            },
         ];
         assert!(validate_changes(&ok, &m).is_ok());
-        let bad = vec![PathChange::single(ChangeKind::Added, "src/c.c")];
+        let bad = vec![RawChange {
+            kind: ChangeKind::Added,
+            old_mode: Some(0),
+            new_mode: Some(0o100644),
+            paths: vec!["src/c.c".into()],
+        }];
         assert!(validate_changes(&bad, &m).is_err());
+    }
+
+    #[test]
+    fn 新增符号链接即使路径合法也被拒绝() {
+        let m = matcher(&["src/uart.c"]);
+        // 路径在写集内，但 Git 模式是符号链接。
+        let changes = vec![RawChange {
+            kind: ChangeKind::Added,
+            old_mode: Some(0),
+            new_mode: Some(0o120000),
+            paths: vec!["src/uart.c".into()],
+        }];
+        let err = validate_changes(&changes, &m).unwrap_err().to_string();
+        assert!(err.contains("符号链接"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn 子模块_gitlink_被拒绝() {
+        let m = matcher(&["vendor/lib"]);
+        let changes = vec![RawChange {
+            kind: ChangeKind::Added,
+            old_mode: Some(0),
+            new_mode: Some(0o160000),
+            paths: vec!["vendor/lib".into()],
+        }];
+        assert!(validate_changes(&changes, &m).is_err());
+    }
+
+    #[test]
+    fn 类型变化被拒绝() {
+        let m = matcher(&["src/uart.c"]);
+        let changes = vec![RawChange {
+            kind: ChangeKind::TypeChanged,
+            old_mode: Some(0o100644),
+            new_mode: Some(0o120000),
+            paths: vec!["src/uart.c".into()],
+        }];
+        assert!(validate_changes(&changes, &m).is_err());
+    }
+
+    #[test]
+    fn 工作区里的真实符号链接可被发现() {
+        let (repo, _dir) = temp_repo("symlink");
+        let base = repo.head().unwrap();
+        let wt = repo.prepare_worktree("T-1", &base).unwrap();
+        let link = wt.join("escape.txt");
+        #[cfg(windows)]
+        {
+            // 普通权限下 Windows 可能不允许创建符号链接；不允许则跳过该项。
+            if std::os::windows::fs::symlink_file("base.txt", &link).is_err() {
+                return;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink("base.txt", &link).unwrap();
+        }
+        let changes = vec![RawChange {
+            kind: ChangeKind::Added,
+            old_mode: Some(0),
+            new_mode: Some(0o100644),
+            paths: vec!["escape.txt".into()],
+        }];
+        let found = find_worktree_symlink(&wt, &changes).unwrap();
+        assert_eq!(found.as_deref(), Some("escape.txt"));
+    }
+
+    #[test]
+    fn 真实仓库中的符号链接条目被拒绝() {
+        let (repo, dir) = temp_repo("symlink-mode");
+        let base = repo.head().unwrap();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} 失败：{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // 直接往索引里写 120000 条目：普通权限的 Windows 无法创建真实符号链接，
+        // 但我们要验证的正是"Git 模式"这一层判定。
+        let blob = git(&["hash-object", "-w", "base.txt"]);
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{blob},link.txt"),
+        ]);
+        git(&["commit", "-q", "-m", "symlink entry"]);
+
+        let changes = repo.changed_entries(&base, &git(&["rev-parse", "HEAD"])).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].new_mode, Some(0o120000), "应解析出符号链接模式");
+
+        let m = matcher(&["link.txt"]);
+        let err = validate_changes(&changes, &m).unwrap_err().to_string();
+        assert!(err.contains("符号链接"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn 花括号写集在条件四中仍按匹配器语义生效() {
+        // 回归用：把 glob 直接当 Git pathspec 时，`{c,h}` 不会被展开，
+        // `git diff --quiet -- 'src/*.{c,h}'` 会匹配不到任何路径并返回 0，
+        // 导致"写集其实变了"被误判成 FRESH。
+        let (repo, _dir) = temp_repo("brace");
+        let base = repo.head().unwrap();
+        let wt = repo.prepare_worktree("T-1", &base).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/a.c"), "int x;\n").unwrap();
+        let snap = repo.snapshot_commit(&wt, "brace").unwrap();
+
+        let m = matcher(&["src/*.{c,h}"]);
+        assert!(
+            !repo.writes_unchanged_between(&base, &snap, &m).unwrap(),
+            "写集内的 src/a.c 被新增，必须判定为已改变"
+        );
+        // 与写集无关的变更不受影响
+        let other = matcher(&["docs/*.md"]);
+        assert!(repo.writes_unchanged_between(&base, &snap, &other).unwrap());
     }
 
     #[test]
@@ -708,13 +935,21 @@ mod tests {
 
         let matcher = WritesMatcher::new(&["src/uart.c".to_string()]).unwrap();
         let snap = repo.snapshot_commit(&wt, "snapshot").unwrap();
-        let changes = repo.changed_paths(&base, &snap).unwrap();
+        let changes = repo.changed_entries(&base, &snap).unwrap();
         assert!(validate_changes(&changes, &matcher).is_ok(), "写集内修改应通过");
+        // 写集未被后续改动时，条件 4 应判定"未变"
+        assert!(repo
+            .writes_unchanged_between(&base, &snap, &matcher)
+            .is_ok());
 
         // 前缀绕过：`src/uart.c.evil` 不在写集内。
         std::fs::write(wt.join("src/uart.c.evil"), "x").unwrap();
         let snap2 = repo.snapshot_commit(&wt, "snapshot2").unwrap();
-        let changes2 = repo.changed_paths(&snap, &snap2).unwrap();
+        let changes2 = repo.changed_entries(&snap, &snap2).unwrap();
         assert!(validate_changes(&changes2, &matcher).is_err(), "前缀绕过必须被拦截");
+        // 而写集内的 `src/uart.c` 自 snap 起未变 → 条件 4 仍为真
+        assert!(repo
+            .writes_unchanged_between(&snap, &snap2, &matcher)
+            .unwrap());
     }
 }

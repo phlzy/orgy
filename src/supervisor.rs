@@ -13,7 +13,7 @@ use crate::config::Spec;
 use crate::db::Db;
 use crate::digest::{plan_digest, spec_digest};
 use crate::error::{Error, Result};
-use crate::git::Repo;
+use crate::git::{Repo, WritesMatcher};
 
 pub const ACCEPTED_REF: &str = "refs/orgy/accepted";
 
@@ -107,10 +107,16 @@ impl Supervisor {
         }
 
         // 条件 4：本任务写集在候选之后未被其他任务改动。
-        if !self
-            .repo
-            .paths_unchanged_between(&receipt.candidate_commit, &accepted, &task.writes)?
-        {
+        //
+        // 这里必须复用写集匹配器，而不是把 `task.writes` 当 Git pathspec 传下去：
+        // Git 的 pathspec 语法与 globset 不同（`{a,b}` 不展开、`*` 的跨目录行为
+        // 也不同），直接传会导致漏检或误报。
+        let matcher = WritesMatcher::new(&task.writes)?;
+        if !self.repo.writes_unchanged_between(
+            &receipt.candidate_commit,
+            &accepted,
+            &matcher,
+        )? {
             return Ok(Freshness::Stale("写集在候选之后被其他任务修改".into()));
         }
 

@@ -152,7 +152,11 @@ impl Job {
     }
 }
 
-/// 启动子进程、并发排空双管道、按超时回收整棵进程树。
+/// 启动子进程、注入提示词、并发排空双管道、按超时回收整棵进程树。
+///
+/// `stdin_data` 是喂给 CLI 的提示词：长提示词必须走标准输入，
+/// 既避开 Windows 命令行长度上限，也不会出现在进程列表里。
+/// 写完后写端立即关闭，CLI 读到 EOF 即知输入结束。
 ///
 /// 返回后保证：日志文件已落盘、子进程已被回收、作业内进程已被终止或自然退出。
 pub fn run_captured(
@@ -160,6 +164,7 @@ pub fn run_captured(
     job: &Job,
     log_path: &Path,
     timeout: Duration,
+    stdin_data: &[u8],
 ) -> Result<RunOutcome> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -171,8 +176,7 @@ pub fn run_captured(
     let mut child = cmd.spawn()?;
     job.assign(&child)?;
 
-    // 立即关闭写端：CLI 读到 EOF 即知道没有更多输入，不会等待交互。
-    drop(child.stdin.take());
+    let stdin = child.stdin.take();
 
     let stdout = child
         .stdout
@@ -188,6 +192,16 @@ pub fn run_captured(
     let mut timed_out = false;
 
     std::thread::scope(|scope| {
+        // 提示词可能超过管道缓冲区（约 64KB），必须单独一个线程写入，
+        // 否则主线程会在写入时阻塞，连超时判断都做不到。
+        if let Some(mut pipe) = stdin {
+            scope.spawn(move || {
+                // 写失败（例如子进程提前退出）不是错误：写端随作用域结束关闭即可。
+                let _ = pipe.write_all(stdin_data);
+                let _ = pipe.flush();
+            });
+        }
+
         let out_sink = Arc::clone(&sink);
         let err_sink = Arc::clone(&sink);
         scope.spawn(move || drain(stdout, out_sink));
@@ -235,7 +249,13 @@ pub fn run_captured(
     })
 }
 
-/// 持续读取管道直到 EOF；超过上限后停止写盘但继续读取，避免管道写满阻塞子进程。
+/// 持续读取管道直到 EOF。
+///
+/// 三条纪律：
+/// 1. 达到日志上限后**停止写盘但继续读取**——管道写满会让子进程阻塞甚至 BrokenPipe；
+/// 2. 写盘失败同样只停止记录，不退出循环；
+/// 3. 不在这里逐块 `flush()`：`BufWriter` 的缓冲正是为减少系统调用而存在，
+///    统一由调用方在末尾刷新一次。
 fn drain(mut reader: impl Read, sink: Arc<Mutex<BufWriter<File>>>) {
     let mut buf = [0u8; READ_CHUNK];
     let mut written: u64 = 0;
@@ -244,13 +264,16 @@ fn drain(mut reader: impl Read, sink: Arc<Mutex<BufWriter<File>>>) {
             Ok(0) => break,
             Ok(n) => {
                 if written < LOG_LIMIT_BYTES {
-                    if let Ok(mut guard) = sink.lock() {
-                        let _ = guard.write_all(&buf[..n]);
-                        if guard.flush().is_err() {
-                            break;
-                        }
+                    let stored = match sink.lock() {
+                        Ok(mut guard) => guard.write_all(&buf[..n]).is_ok(),
+                        Err(_) => false,
+                    };
+                    if stored {
+                        written += n as u64;
+                    } else {
+                        // 磁盘满或锁中毒：标记为已满，后续只排空不落盘。
+                        written = LOG_LIMIT_BYTES;
                     }
-                    written += n as u64;
                 }
             }
             Err(_) => break,
@@ -286,11 +309,42 @@ mod tests {
     fn 正常退出并采集日志() {
         let job = Job::new().unwrap();
         let log = case_dir("ok").join("echo.log");
-        let outcome = run_captured(echo_cmd("hello-orgy"), &job, &log, Duration::from_secs(10)).unwrap();
+        let outcome = run_captured(
+            echo_cmd("hello-orgy"),
+            &job,
+            &log,
+            Duration::from_secs(10),
+            b"",
+        )
+        .unwrap();
         assert!(!outcome.timed_out);
         assert_eq!(outcome.exit_code, Some(0));
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("hello-orgy"), "日志内容：{text}");
+    }
+
+    #[test]
+    fn 提示词经_stdin_注入() {
+        let job = Job::new().unwrap();
+        let log = case_dir("stdin").join("stdin.log");
+        let mut cmd = Command::new("cmd");
+        // `more` 把 stdin 原样转发到 stdout，用来验证提示词确实走管道入。
+        cmd.args(["/c", "more"]);
+        let prompt = "PROMPT-LINE-1\nPROMPT-LINE-2\n";
+        let outcome = run_captured(
+            cmd,
+            &job,
+            &log,
+            Duration::from_secs(10),
+            prompt.as_bytes(),
+        )
+        .unwrap();
+        assert!(!outcome.timed_out);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            text.contains("PROMPT-LINE-1") && text.contains("PROMPT-LINE-2"),
+            "日志内容：{text}"
+        );
     }
 
     #[test]
@@ -299,7 +353,8 @@ mod tests {
         let log = case_dir("exit3").join("exit3.log");
         let mut cmd = Command::new("cmd");
         cmd.args(["/c", "exit", "3"]);
-        let outcome = run_captured(cmd, &job, &log, Duration::from_secs(10)).unwrap();
+        let outcome =
+            run_captured(cmd, &job, &log, Duration::from_secs(10), b"").unwrap();
         assert!(!outcome.timed_out);
         assert_eq!(outcome.exit_code, Some(3));
     }
@@ -312,7 +367,8 @@ mod tests {
         // 父进程 + 孙进程同时存活，用于验证作业回收。
         cmd.args(["/c", "ping -n 30 127.0.0.1 > nul & ping -n 30 127.0.0.1 > nul"]);
         let started = Instant::now();
-        let outcome = run_captured(cmd, &job, &log, Duration::from_secs(1)).unwrap();
+        let outcome =
+            run_captured(cmd, &job, &log, Duration::from_secs(1), b"").unwrap();
         assert!(outcome.timed_out, "应判定为超时");
         assert_eq!(outcome.exit_code, None);
         assert!(
